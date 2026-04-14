@@ -1,41 +1,49 @@
 """
 Finance agent (CFO / corporate finance lens).
 
-Diagnoses loss drivers, cash and working capital risks, and near-term financial
-actions. Consumes the intake case brief dict (summary + findings).
-Returns the shared six-field standard_report structure (mock for Phase 1–2).
+Phase 5: loads prompts/finance_prompt.md, sends the intake case brief to OpenAI,
+and maps the JSON reply into the shared six-field shape from schemas.agent_output.
+
+If the API fails or the response is not valid JSON, falls back to the Phase 1-style
+mock finance report and prints a short warning.
 """
 
 from __future__ import annotations
 
-from agents._output import standard_report
+import json
+
+from schemas.agent_output import standard_report
+from services.openai_client import generate_agent_response
+from utils.consulting_json import JSON_SHAPE_INSTRUCTION, parse_model_json, standard_report_from_parsed
+from utils.prompt_loader import load_prompt
+
+# Extra instructions sent with the case brief so the model stays in CFO/restructuring voice
+# and does not echo intake or sound like the Strategy Agent.
+_FINANCE_USER_ADDENDUM = """
+Task discipline for this response:
+- Ground every bullet in the case brief JSON above; cite its themes implicitly (do not invent facts).
+- Open the summary with liquidity and margin/cost pressure (cash runway, gross or contribution margin, fixed vs variable load)—not a generic "company faces challenges" opener.
+- Findings and recommendations must use turnaround finance vocabulary: runway, liquidity, margin bridge, contribution, fixed/variable cost, working capital, capital allocation, spend freezes, scenario cash views.
+- Do not write a strategy or positioning memo. Mention ICP or positioning only if tied to margin, discounting, or cash (e.g., unprofitable segments).
+- Do not paste the intake summary verbatim; translate into financial mechanisms.
+"""
 
 
-def _brief_snippet(case_brief: dict, max_chars: int = 400) -> str:
-    """Join intake fields into one line the mock can reference without being an LLM."""
-    summary = str(case_brief.get("summary", "")).strip()
-    findings = case_brief.get("findings") or []
-    parts = [summary]
-    for item in findings[:3]:
-        parts.append(str(item))
-    blob = " ".join(parts)
-    return blob if len(blob) <= max_chars else blob[: max_chars - 3] + "..."
+def _case_brief_block(case_brief: dict) -> str:
+    """Serialize intake output so the model sees structured context."""
+    return json.dumps(case_brief, ensure_ascii=False, indent=2)
 
 
-def run_finance_agent(case_brief: dict) -> dict:
-    """
-    Produce a mock financial diagnosis aligned with the intake brief.
-
-    Input: dict from run_intake_agent (must include summary, findings).
-    Output: standard_report dict.
-    """
-    _ = _brief_snippet(case_brief)  # reserved for future templating / LLM context
+def _mock_finance_report(case_brief: dict) -> dict:
+    """Deterministic fallback (original mock) if OpenAI is unavailable."""
+    _ = case_brief  # kept for API symmetry; mock text is generic turnaround finance
 
     summary = (
         "Financially, this profile is consistent with a 'high revenue, negative EBITDA' trap: "
         "losses persist because gross margin after discounts does not cover operating load, "
         "and cash is absorbed by working capital and/or fixed cost inertia. "
-        "The immediate objective is to stabilize liquidity while building a credible bridge back to contribution margin."
+        "The immediate objective is to stabilize liquidity while building a credible bridge back to contribution margin. "
+        "(Mock finance: OpenAI unavailable.)"
     )
 
     findings = [
@@ -72,3 +80,47 @@ def run_finance_agent(case_brief: dict) -> dict:
         recommendations=recommendations,
         assumptions=assumptions,
     )
+
+
+def run_finance_agent(case_brief: dict) -> dict:
+    """
+    Produce a financial diagnosis from the intake case brief.
+
+    Input: dict from run_intake_agent.
+    Output: standard_report dict.
+    """
+    markdown_instructions = load_prompt("prompts/finance_prompt.md").strip()
+    system_instruction = (
+        markdown_instructions + "\n\n" + JSON_SHAPE_INSTRUCTION.strip()
+    ).strip()
+
+    user_message = (
+        "Case brief from intake (JSON):\n"
+        + _case_brief_block(case_brief)
+        + "\n\n"
+        + _FINANCE_USER_ADDENDUM.strip()
+        + "\n\nProduce the JSON object described in your instructions."
+    )
+
+    try:
+        raw_text = generate_agent_response(
+            instructions=system_instruction,
+            user_input=user_message,
+        )
+    except Exception as exc:
+        print(f"Finance agent OpenAI failed: {exc}")
+        print("Using fallback mock finance output.")
+        return _mock_finance_report(case_brief)
+
+    if not raw_text:
+        print("Finance agent OpenAI returned empty text.")
+        print("Using fallback mock finance output.")
+        return _mock_finance_report(case_brief)
+
+    try:
+        obj = parse_model_json(raw_text)
+        return standard_report_from_parsed(obj, "finance")
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"Finance agent could not parse OpenAI response: {exc}")
+        print("Using fallback mock finance output.")
+        return _mock_finance_report(case_brief)

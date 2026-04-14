@@ -1,23 +1,41 @@
 """
 Operations agent (COO / lean operations lens).
 
-Focuses on cost-to-serve, process waste, procurement, and service delivery
-drivers of margin and retention. Consumes the intake case brief dict.
-Returns the shared six-field standard_report structure (mock for Phase 1–2).
+Phase 6: loads prompts/operations_prompt.md, sends the intake case brief to OpenAI,
+and maps the JSON reply into the shared six-field shape from schemas.agent_output.
+
+Focuses on cost-to-serve, process waste, procurement, and service delivery—not
+corporate finance modeling or market strategy. If the API fails or the response
+is not valid JSON, falls back to a deterministic mock and prints a warning.
 """
 
 from __future__ import annotations
 
-from agents._output import standard_report
+import json
+
+from schemas.agent_output import standard_report
+from services.openai_client import generate_agent_response
+from utils.consulting_json import JSON_SHAPE_INSTRUCTION, parse_model_json, standard_report_from_parsed
+from utils.prompt_loader import load_prompt
+
+# Keeps the model in an operational voice and out of finance/strategy territory.
+_OPERATIONS_USER_ADDENDUM = """
+Task discipline for this response:
+- Ground every bullet in the case brief JSON above; do not invent facts.
+- Write like a COO or head of operations: throughput, SLAs, fulfillment, procurement, supplier terms, capacity, queues, rework, cost-to-serve, SKU/customer mix complexity, order-to-cash friction.
+- Do not produce a CFO-style liquidity or runway memo. Mention cash only when tied to working capital, payables, or inventory/service inputs.
+- Do not produce a strategy or positioning memo. Mention segments or pricing only when tied to operational complexity, discount execution at the deal desk, or delivery promises.
+- Do not paste the intake summary verbatim; translate into operating mechanisms and process levers.
+"""
 
 
-def run_operations_agent(case_brief: dict) -> dict:
-    """
-    Produce a mock operational diagnosis aligned with the intake brief.
+def _case_brief_block(case_brief: dict) -> str:
+    """Serialize intake output so the model sees structured context."""
+    return json.dumps(case_brief, ensure_ascii=False, indent=2)
 
-    Input: dict from run_intake_agent.
-    Output: standard_report dict.
-    """
+
+def _mock_operations_report(case_brief: dict) -> dict:
+    """Deterministic fallback if OpenAI is unavailable."""
     findings_text = case_brief.get("findings") or []
     has_discount_story = any(
         "discount" in str(x).lower() for x in findings_text
@@ -27,7 +45,8 @@ def run_operations_agent(case_brief: dict) -> dict:
         "Operationally, aggressive discounting combined with retention pressure usually "
         "maps to service variability, fulfillment friction, or a SKU/customer mix that is "
         "too complex for the current operating model. "
-        "The goal is quick structural cost removal without breaking the few journeys that create real margin."
+        "The goal is quick structural cost removal without breaking the few journeys that create real margin. "
+        "(Mock operations: OpenAI unavailable.)"
     )
 
     findings = [
@@ -67,3 +86,47 @@ def run_operations_agent(case_brief: dict) -> dict:
         recommendations=recommendations,
         assumptions=assumptions,
     )
+
+
+def run_operations_agent(case_brief: dict) -> dict:
+    """
+    Produce an operational diagnosis from the intake case brief.
+
+    Input: dict from run_intake_agent.
+    Output: standard_report dict.
+    """
+    markdown_instructions = load_prompt("prompts/operations_prompt.md").strip()
+    system_instruction = (
+        markdown_instructions + "\n\n" + JSON_SHAPE_INSTRUCTION.strip()
+    ).strip()
+
+    user_message = (
+        "Case brief from intake (JSON):\n"
+        + _case_brief_block(case_brief)
+        + "\n\n"
+        + _OPERATIONS_USER_ADDENDUM.strip()
+        + "\n\nProduce the JSON object described in your instructions."
+    )
+
+    try:
+        raw_text = generate_agent_response(
+            instructions=system_instruction,
+            user_input=user_message,
+        )
+    except Exception as exc:
+        print(f"Operations agent OpenAI failed: {exc}")
+        print("Using fallback mock operations output.")
+        return _mock_operations_report(case_brief)
+
+    if not raw_text:
+        print("Operations agent OpenAI returned empty text.")
+        print("Using fallback mock operations output.")
+        return _mock_operations_report(case_brief)
+
+    try:
+        obj = parse_model_json(raw_text)
+        return standard_report_from_parsed(obj, "operations")
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"Operations agent could not parse OpenAI response: {exc}")
+        print("Using fallback mock operations output.")
+        return _mock_operations_report(case_brief)
