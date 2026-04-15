@@ -5,8 +5,9 @@ This script models a small multi-agent workflow similar to how a turnaround
 engagement might be staffed (intake, finance, operations, strategy, review).
 All five stages use OpenAI when configured (with mock fallbacks on failure).
 
-When you run this file, you type your business problem in the terminal; the
-pipeline runs on that text (multiline is supported—finish with an empty line).
+Intake from the terminal uses mode-based questions (Quick / Guided / Detailed).
+Answers are normalized into one case dictionary, shown back for confirmation,
+then converted to a single narrative string for the existing intake agent.
 
 Phase 2: every agent's return value is built through helpers in
 schemas/agent_output.py so the dict keys stay consistent and easy to maintain.
@@ -15,11 +16,7 @@ Phase 3: each agent loads its Markdown instructions from prompts/ via
 utils/prompt_loader.py on every run.
 
 Phase 4–6: agents use OpenAI's Responses API (see services/openai_client.py).
-Phase 6 adds OpenAI-backed operations and reviewer agents.
 Set OPENAI_API_KEY (e.g. in a .env file loaded below) and install requirements.txt.
-
-Example problem you could paste when prompted:
-    Revenue is flat, costs are up, and we are burning cash. Retention is weak.
 
 Run from the project root:
 
@@ -40,80 +37,15 @@ from agents.intake_agent import run_intake_agent
 from agents.operations_agent import run_operations_agent
 from agents.reviewer_agent import run_reviewer_agent
 from agents.strategy_agent import run_strategy_agent
-
-_VAGUE_INPUTS = {
-    "hi",
-    "hello",
-    "heyy",
-    "hey",
-    "help",
-    "test",
-    "ok",
-}
-
-_BUSINESS_KEYWORDS = {
-    "revenue",
-    "cost",
-    "costs",
-    "margin",
-    "margins",
-    "retention",
-    "customer",
-    "customers",
-    "loss",
-    "losses",
-    "pricing",
-    "cash",
-    "growth",
-    "profit",
-    "profits",
-    "ebitda",
-    "churn",
-    "discount",
-    "turnaround",
-}
-
-
-def read_client_problem() -> str:
-    """
-    Prompt for the client's situation in the terminal.
-
-    Reads one or more lines until the user enters a blank line, then joins
-    them with newlines. If nothing was typed, asks again.
-    """
-    while True:
-        print("Describe your company situation:")
-        print("(Type your problem. Press Enter on an empty line when you are done.)")
-        lines: list[str] = []
-        while True:
-            line = input()
-            if line == "":
-                break
-            lines.append(line)
-        text = "\n".join(lines).strip()
-        if text:
-            return text
-        print("Please enter at least a short description.\n")
-
-
-def validate_client_problem(text: str) -> tuple[bool, str]:
-    """
-    Basic guardrail before running the multi-agent analysis.
-
-    Returns (is_valid, reason_if_invalid).
-    """
-    cleaned = text.strip().lower()
-    words = [w.strip(".,!?;:()[]{}\"'") for w in cleaned.split() if w.strip()]
-
-    if not words:
-        return False, "No input detected."
-    if cleaned in _VAGUE_INPUTS:
-        return False, "Input is too vague."
-    if len(words) < 8:
-        return False, "Please provide a bit more detail (at least 8 words)."
-    if not any(keyword in cleaned for keyword in _BUSINESS_KEYWORDS):
-        return False, "Please include business context (for example revenue, costs, margins, customers, or cash)."
-    return True, ""
+from utils.case_intake import (
+    case_to_client_narrative,
+    collect_case_by_mode,
+    confirm_analysis,
+    format_case_summary,
+    normalize_case,
+    prompt_mode_choice,
+    validate_collected_case,
+)
 
 
 def run_turnaround_pipeline(client_problem: str) -> dict[str, Any]:
@@ -155,7 +87,8 @@ def _print_founder_report(report_text: str) -> None:
 
 
 def _should_show_detailed_outputs() -> bool:
-    answer = input("\nShow detailed agent outputs? (y/N): ").strip().lower()
+    print("\nShow detailed agent outputs? (y/N): ", end="", flush=True)
+    answer = input().strip().lower()
     return answer in {"y", "yes"}
 
 
@@ -163,16 +96,26 @@ if __name__ == "__main__":
     # Load project-root .env into os.environ so OPENAI_API_KEY is available to the intake agent.
     load_dotenv()
 
-    client_problem = read_client_problem()
-    is_valid, reason = validate_client_problem(client_problem)
+    # --- Terminal welcome and mode-based intake ---
+    print("\n" + "=" * 72)
+    print("Welcome to the AI management consulting simulator.")
+    print("You will answer a few questions; we will summarize them before running the analysis.")
+    print("=" * 72)
+
+    mode = prompt_mode_choice()
+    raw_case = collect_case_by_mode(mode)
+    case = normalize_case(raw_case)
+
+    print("\n" + format_case_summary(case))
+    if not confirm_analysis():
+        print("\nOkay - analysis cancelled. Run again when you are ready.")
+        raise SystemExit(0)
+
+    client_problem = case_to_client_narrative(case)
+    is_valid, reason = validate_collected_case(case)
     if not is_valid:
-        print("Please describe a real company situation before running the consulting analysis.")
-        print(f"Reason: {reason}")
-        print(
-            "Example input: Our company has had 3 years of losses despite strong revenue. "
-            "Costs are rising, margins are shrinking, and customer retention is falling. "
-            "We need a turnaround plan."
-        )
+        print(f"\nCannot run analysis yet: {reason}")
+        print("Tip: add revenue, cash/runway, or margin-related detail in your answers.")
         raise SystemExit(0)
 
     results = run_turnaround_pipeline(client_problem)
