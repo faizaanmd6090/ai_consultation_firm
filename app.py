@@ -44,8 +44,18 @@ from utils.case_intake import (
     format_case_summary,
     normalize_case,
     prompt_mode_choice,
-    validate_collected_case,
 )
+from utils.input_validation import validate_intake_case
+
+
+def _print_intake_validation_help() -> None:
+    """Short examples after field-level validation failure."""
+    print("\nExamples of valid answers:")
+    print("  - Revenue: $1.2M ARR, 500k per year, 2 million (rough), or n/a with strong detail elsewhere")
+    print("  - Revenue period: monthly, quarterly, annual (yearly is fine)")
+    print("  - Profit / loss: profit, loss, break-even, profitable, losing money")
+    print("  - Headcount: 12, 50 FTE, about 30 employees")
+    print()
 
 
 def run_turnaround_pipeline(client_problem: str) -> dict[str, Any]:
@@ -111,12 +121,18 @@ if __name__ == "__main__":
         print("\nOkay - analysis cancelled. Run again when you are ready.")
         raise SystemExit(0)
 
-    client_problem = case_to_client_narrative(case)
-    is_valid, reason = validate_collected_case(case)
-    if not is_valid:
-        print(f"\nCannot run analysis yet: {reason}")
-        print("Tip: add revenue, cash/runway, or margin-related detail in your answers.")
+    ok, intake_errors = validate_intake_case(case, mode)
+    if not ok:
+        print(
+            "\nSome inputs do not look valid yet. "
+            "Please correct the fields below before running analysis."
+        )
+        for err in intake_errors:
+            print(f"  - {err}")
+        _print_intake_validation_help()
         raise SystemExit(0)
+
+    client_problem = case_to_client_narrative(case)
 
     results = run_turnaround_pipeline(client_problem)
     founder_report = run_final_report_agent(
