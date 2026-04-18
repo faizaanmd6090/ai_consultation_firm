@@ -2,7 +2,7 @@
 Founder-facing final report layer.
 
 Takes outputs from intake, finance, operations, strategy, and reviewer,
-and turns them into a short CEO/founder report.
+and turns them into a calibrated CEO/founder report.
 
 Primary path uses OpenAI for concise synthesis. If OpenAI fails or returns
 empty content, falls back to a deterministic summary built from existing outputs.
@@ -28,12 +28,20 @@ def _take(field: str, output: dict, default: list[str]) -> list[str]:
 
 _SECTION_ORDER = [
     "Executive Summary",
-    "Top 3 to 5 Core Problems",
+    "Core Problems",
     "Immediate Priorities",
     "Biggest Risks",
+    "Missing Critical Data",
     "30/60/90 Day Action Plan",
     "Key Metrics to Watch",
 ]
+
+_SECTION_ALIASES = {
+    "top 3 to 5 core problems": "Core Problems",
+    "core problems": "Core Problems",
+    "missing data": "Missing Critical Data",
+    "missing critical data": "Missing Critical Data",
+}
 
 _GENERIC_PATTERNS = (
     "improve efficiency",
@@ -43,6 +51,16 @@ _GENERIC_PATTERNS = (
     "enhance performance",
     "take a holistic approach",
 )
+
+_VAGUE_VERBS = (
+    "reassess",
+    "optimize",
+    "improve",
+    "streamline",
+    "enhance",
+)
+
+_DECISION_PREFIXES = ("STOP:", "TEST:", "KEEP:", "INVESTIGATE:")
 
 
 def _normalize_line_key(text: str) -> str:
@@ -56,7 +74,21 @@ def _looks_generic(text: str) -> bool:
 
 def _is_quantified(text: str) -> bool:
     lowered = text.lower()
-    return any(token in lowered for token in ("%","weekly","monthly","days","weeks","months","<",">"," to ","-"))
+    return any(
+        token in lowered
+        for token in (
+            "%",
+            "weekly",
+            "monthly",
+            "days",
+            "weeks",
+            "months",
+            "<",
+            ">",
+            " to ",
+            "target range",
+        )
+    )
 
 
 def _sharpen_generic_line(text: str, fallback: str) -> str:
@@ -68,9 +100,7 @@ def _sharpen_generic_line(text: str, fallback: str) -> str:
 
 
 def _flatten_value_to_lines(value: object) -> list[str]:
-    """
-    Flatten nested model output values (dict/list/str) into readable lines.
-    """
+    """Flatten nested model output values (dict/list/str) into readable lines."""
     out: list[str] = []
     if isinstance(value, str):
         value_lines = [line.strip() for line in value.splitlines() if line.strip()]
@@ -100,10 +130,174 @@ def _flatten_value_to_lines(value: object) -> list[str]:
     return []
 
 
+def _canonical_section_name(name: str) -> str:
+    key = name.strip().lower()
+    if key in _SECTION_ALIASES:
+        return _SECTION_ALIASES[key]
+    for canonical in _SECTION_ORDER:
+        if key == canonical.lower():
+            return canonical
+    return name
+
+
+def _pick_decision_prefix(text: str) -> str:
+    lower = text.lower()
+    if any(w in lower for w in ("pause", "cut", "stop", "freeze", "ban", "cap")):
+        return "STOP:"
+    if any(w in lower for w in ("test", "pilot", "experiment", "try", "a/b")):
+        return "TEST:"
+    if any(w in lower for w in ("keep", "protect", "maintain", "double down")):
+        return "KEEP:"
+    return "INVESTIGATE:"
+
+
+def _normalize_immediate_priorities(items: list[str]) -> list[str]:
+    """
+    Enforce ranked 1-5 priorities with STOP/TEST/KEEP/INVESTIGATE prefixes.
+    """
+    normalized: list[str] = []
+    for raw in items:
+        text = raw.strip().lstrip("-").strip()
+        if not text:
+            continue
+        # Strip any leading numbering like "1)" or "1." or "1 -".
+        text = re.sub(r"^\s*\d+\s*[\)\.\-:]\s*", "", text).strip()
+        if not text:
+            continue
+        upper = text.upper()
+        if upper.startswith(_DECISION_PREFIXES):
+            normalized.append(text)
+        else:
+            normalized.append(f"{_pick_decision_prefix(text)} {text}")
+
+    # Deduplicate (preserve order)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in normalized:
+        key = _normalize_line_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    # Exactly 5 items, keep most concrete first.
+    deduped = deduped[:5]
+    while len(deduped) < 5:
+        deduped.append("INVESTIGATE: Identify the single biggest cost or churn driver, set a weekly metric, and decide keep/cut within 2 weeks.")
+
+    # Add ranking numbers.
+    ranked = [f"{idx+1}. {item}" for idx, item in enumerate(deduped)]
+    return ranked
+
+
+def _contains_vague_verb_without_detail(text: str) -> bool:
+    lower = text.strip().lower()
+    if not any(v in lower for v in _VAGUE_VERBS):
+        return False
+    # If it contains a concrete connector/metric, allow it.
+    concrete_markers = (" if ", " within ", " by ", " using ", " cap ", " threshold", " target", " > ", " < ", "%", " for ")
+    return not any(m in lower for m in concrete_markers)
+
+
+def _normalize_metric_trigger_action(items: list[str]) -> list[str]:
+    """
+    Ensure each metric line reads as: Metric - Trigger - Action.
+    """
+    out: list[str] = []
+    for raw in items:
+        text = raw.strip().lstrip("-").strip()
+        if not text:
+            continue
+        if " - " in text:
+            parts = [p.strip() for p in text.split(" - ") if p.strip()]
+            if len(parts) >= 3:
+                out.append(f"{parts[0]} - {parts[1]} - {parts[2]}")
+                continue
+        # If the model gives "Metric: blah", convert to a trigger/action template.
+        if ":" in text and text.count(":") == 1:
+            metric, rest = [p.strip() for p in text.split(":", 1)]
+            out.append(f"{metric} - If {rest} drifts against plan for 2 weeks - Reduce spend/scope and investigate driver")
+            continue
+        out.append(f"{text} - If off plan for 2 consecutive weeks - Investigate driver and adjust the next lever")
+
+    # Keep concise
+    return out[:8]
+
+
+def _extract_section(parsed: dict, section: str) -> object | None:
+    # Direct match first.
+    if section in parsed:
+        return parsed[section]
+    # Case-insensitive + alias fallback.
+    for key, value in parsed.items():
+        if _canonical_section_name(str(key)) == section:
+            return value
+    return None
+
+
+def _normalize_fact_hypothesis_prefix(section: str, item: str) -> str:
+    text = item.strip()
+    if not text:
+        return text
+    if section in ("Core Problems", "Biggest Risks"):
+        lower = text.lower()
+        if lower.startswith("fact:") or lower.startswith("hypothesis:"):
+            return text
+        # Default to hypothesis unless direct factual language is obvious.
+        factual_markers = ("reported", "stated", "provided", "current", "actual", "fact:")
+        if any(marker in lower for marker in factual_markers):
+            return f"Fact: {text}"
+        return f"Hypothesis: {text}"
+    return text
+
+
+def _render_306090(items: list[str]) -> list[str]:
+    buckets: dict[str, list[str]] = {"30 Days": [], "60 Days": [], "90 Days": []}
+    current = "30 Days"
+
+    for item in items:
+        stripped = item.strip().lstrip("-").strip()
+        lower = stripped.lower()
+        if lower.startswith("30 days"):
+            current = "30 Days"
+            remainder = stripped[len("30 days") :].lstrip(":").strip()
+            if remainder:
+                buckets[current].append(remainder)
+            continue
+        if lower.startswith("60 days"):
+            current = "60 Days"
+            remainder = stripped[len("60 days") :].lstrip(":").strip()
+            if remainder:
+                buckets[current].append(remainder)
+            continue
+        if lower.startswith("90 days"):
+            current = "90 Days"
+            remainder = stripped[len("90 days") :].lstrip(":").strip()
+            if remainder:
+                buckets[current].append(remainder)
+            continue
+        buckets[current].append(stripped)
+
+    lines = ["30 Days", "60 Days", "90 Days"]
+    out: list[str] = []
+    for label in lines:
+        out.append(label)
+        section_items = buckets[label] or ["Define owner and measurable outcome for this phase."]
+        # Strip any nested label artifacts.
+        cleaned: list[str] = []
+        for line in section_items:
+            s = line.strip()
+            s = re.sub(r"^(30|60|90)\s*days\s*:\s*", "", s, flags=re.IGNORECASE).strip()
+            if s:
+                cleaned.append(s)
+        for line in cleaned[:5]:
+            out.append(f"- {line}")
+        out.append("")
+    return out
+
+
 def _format_model_report_text(raw_text: str) -> str:
-    """
-    Keep founder output readable even if the model returns JSON.
-    """
+    """Keep founder output readable even if the model returns JSON."""
     text = raw_text.strip()
     try:
         parsed = json.loads(text)
@@ -114,37 +308,30 @@ def _format_model_report_text(raw_text: str) -> str:
     if "report" in parsed and isinstance(parsed["report"], dict):
         parsed = parsed["report"]
 
-    section_order = _SECTION_ORDER
     sharpen_defaults = {
-        "Immediate Priorities": "Set weekly burn targets, cap discretionary spend, and run a weekly CAC/payback channel cut decision.",
-        "Biggest Risks": "If burn remains above plan for two consecutive weeks, liquidity risk accelerates before fixes take hold.",
-        "30/60/90 Day Action Plan": "Sequence actions by week with owners and measurable thresholds before scaling.",
-        "Key Metrics to Watch": "Track weekly burn, CAC payback, gross margin, discount rate, and retention by cohort.",
+        "Immediate Priorities": "Set owner, weekly cadence, and a conditional target range for the next action.",
+        "Biggest Risks": "Hypothesis: If execution slips for two consecutive weeks, cash and confidence risk increase quickly.",
+        "Missing Critical Data": "Fact: Missing cohort retention, channel CAC/payback, and true gross margin by segment.",
+        "Key Metrics to Watch": "Track weekly burn, runway weeks, CAC payback, gross margin by segment, and retention by cohort.",
     }
 
     seen_lines: set[str] = set()
     lines: list[str] = []
-    for section in section_order:
-        value = parsed.get(section)
-        if value is None:
-            numbered_key = next(
-                (k for k in parsed.keys() if section.lower() in str(k).lower()), None
-            )
-            value = parsed.get(numbered_key) if numbered_key else None
+    for section in _SECTION_ORDER:
+        value = _extract_section(parsed, section)
         if value is None:
             continue
         lines.append(section)
-        section_items: list[str] = []
-        section_items.extend(_flatten_value_to_lines(value))
-
+        section_items = _flatten_value_to_lines(value)
         if not section_items:
             lines.append("")
             continue
 
         cleaned_items: list[str] = []
         for item in section_items:
+            calibrated = _normalize_fact_hypothesis_prefix(section, item)
             sharpened = _sharpen_generic_line(
-                item, sharpen_defaults.get(section, item)
+                calibrated, sharpen_defaults.get(section, calibrated)
             ).strip()
             if not sharpened:
                 continue
@@ -154,18 +341,33 @@ def _format_model_report_text(raw_text: str) -> str:
             seen_lines.add(key)
             cleaned_items.append(sharpened)
 
-        for idx, item in enumerate(cleaned_items):
-            if section == "30/60/90 Day Action Plan":
-                if item.lower().startswith("30") or item.lower().startswith("60") or item.lower().startswith("90"):
-                    lines.append(f"- {item}")
-                elif idx == 0:
-                    lines.append(f"- 30 Days: {item}")
-                elif idx == 1:
-                    lines.append(f"- 60 Days: {item}")
+        if section == "Immediate Priorities":
+            # Guard vague verbs by forcing concrete decision prefixes.
+            guarded: list[str] = []
+            for item in cleaned_items:
+                if _contains_vague_verb_without_detail(item):
+                    guarded.append(
+                        "INVESTIGATE: Convert this into a decision with a trigger (what to stop/test/keep and what threshold decides)."
+                    )
                 else:
-                    lines.append(f"- 90 Days: {item}")
-            else:
+                    guarded.append(item)
+            for item in _normalize_immediate_priorities(guarded):
+                lines.append(item)
+            lines.append("")
+            continue
+
+        if section == "30/60/90 Day Action Plan":
+            lines.extend(_render_306090(cleaned_items))
+            continue
+
+        if section == "Key Metrics to Watch":
+            for item in _normalize_metric_trigger_action(cleaned_items):
                 lines.append(f"- {item}")
+            lines.append("")
+            continue
+
+        for item in cleaned_items[:6]:
+            lines.append(f"- {item}")
         lines.append("")
 
     return "\n".join(lines).strip() or text
@@ -189,80 +391,102 @@ def _fallback_founder_report(
 
     core_problems: list[str] = []
     if finance_findings:
-        core_problems.append(finance_findings[0])
+        core_problems.append(f"Hypothesis: {finance_findings[0]}")
     if ops_findings:
-        core_problems.append(ops_findings[0])
+        core_problems.append(f"Hypothesis: {ops_findings[0]}")
     if strategy_findings:
-        core_problems.append(strategy_findings[0])
+        core_problems.append(f"Hypothesis: {strategy_findings[0]}")
     if len(core_problems) < 3:
-        core_problems.extend(
-            _take("findings", reviewer_output, [])[: 3 - len(core_problems)]
-        )
+        for item in _take("findings", reviewer_output, []):
+            core_problems.append(f"Hypothesis: {item}")
+            if len(core_problems) >= 3:
+                break
 
-    immediate_priorities = review_priority[:5] or _take(
+    immediate_priorities = review_priority[:4] or _take(
         "recommendations", reviewer_output, []
-    )[:5]
+    )[:4]
+
+    missing_data = [
+        "Fact: Customer cohort retention and churn by segment are not explicitly provided.",
+        "Fact: Channel-level CAC and payback are missing, so budget reallocation should stay conditional.",
+        "Fact: Unit economics by product/service mix are incomplete, limiting confidence in hard cost or headcount targets.",
+    ]
 
     d30 = [
-        "Install a weekly cash control room: set burn target, owner, and escalation trigger if burn is >10% above plan for 2 weeks.",
-        "Run channel-level CAC/payback review; pause paid channels with payback above target range (for example >9-12 months).",
+        "Validate baseline numbers: weekly burn, runway, gross margin by segment, and current discount practices.",
+        "Install a weekly control rhythm with owners; use target ranges and adjust only after two weeks of observed data.",
     ]
     d60 = [
-        "Test pricing and offer redesign on highest-volume segments: reduce discount depth and track close-rate impact weekly.",
-        "Launch retention experiments for at-risk cohorts (save offers, onboarding fixes, success calls) and publish weekly cohort retention.",
+        "Run pricing and offer tests with guardrails; keep changes reversible and measure conversion plus margin impact weekly.",
+        "Launch retention experiments on highest-risk cohorts and track save-rate before scaling.",
     ]
     d90 = [
-        "Scale profitable channels and offers; reallocate budget from weak channels to high-conversion sources.",
-        "Lock governance: discount approval thresholds, weekly margin bridge review, and monthly product/service mix decisions.",
+        "Scale only the levers that show repeatable improvement in margin, retention, or payback.",
+        "Lock governance: conditional thresholds for discount approvals, channel spend shifts, and hiring decisions.",
     ]
 
     metrics = [
-        "Weekly net burn vs plan (target range and variance trigger)",
-        "Runway weeks at current burn and at committed plan burn",
-        "CAC and payback by channel (review weekly; cut channels above target payback)",
+        "Weekly burn vs plan (target range, not a single hard point)",
+        "Runway weeks under base and downside assumptions",
         "Gross/contribution margin by segment and offer",
+        "CAC and payback by channel (conditional thresholds)",
         "Retention/churn by cohort and save-rate on at-risk accounts",
-        "Average discount rate and share of deals above discount threshold",
+        "Discount rate and share of deals above approval threshold",
     ]
 
     lines: list[str] = []
     lines.append("Executive Summary")
     lines.append(
-        "- "
+        "- Fact: "
         + (
             review_summary
-            or "Leadership should prioritize cash stability, operational discipline, and focused growth execution."
+            or "Current evidence indicates pressure on cash discipline, margin quality, and execution sequencing."
         )
+    )
+    lines.append(
+        "- Hypothesis: Some root causes remain unverified because core operating and unit-economic data are incomplete."
     )
     lines.append("- (Fallback founder report: OpenAI unavailable.)")
     lines.append("")
 
-    lines.append("Top 3 to 5 Core Problems")
+    lines.append("Core Problems")
     for item in core_problems[:5]:
         lines.append(f"- {item}")
     lines.append("")
 
     lines.append("Immediate Priorities")
-    for item in immediate_priorities[:4]:
-        lines.append(f"- {_sharpen_generic_line(item, 'Set weekly targets, owners, and thresholds for each action so execution can be measured.')}")
-    lines.append("- Set weekly burn, CAC payback, and discount-threshold targets; review in a single founder scorecard.")
+    for item in immediate_priorities:
+        lines.append(
+            "- "
+            + _sharpen_generic_line(
+                item,
+                "Set owner, weekly cadence, and conditional target range before committing large irreversible moves.",
+            )
+        )
     lines.append("")
 
     lines.append("Biggest Risks")
     for item in review_risks[:4]:
+        lines.append(f"- Hypothesis: {item}")
+    lines.append("")
+
+    lines.append("Missing Critical Data")
+    for item in missing_data:
         lines.append(f"- {item}")
     lines.append("")
 
     lines.append("30/60/90 Day Action Plan")
-    lines.append("- 30 Days:")
+    lines.append("30 Days")
     for item in d30:
-        lines.append(f"  - {item}")
-    lines.append("- 60 Days:")
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("60 Days")
     for item in d60:
-        lines.append(f"  - {item}")
-    lines.append("- 90 Days:")
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("90 Days")
     for item in d90:
-        lines.append(f"  - {item}")
+        lines.append(f"- {item}")
     lines.append("")
 
     lines.append("Key Metrics to Watch")
@@ -298,11 +522,14 @@ def run_final_report_agent(
         + "\n\n"
         + _json_block("Reviewer", reviewer_output)
         + "\n\nQuality checklist:\n"
+        + "- Separate facts from hypotheses using explicit prefixes.\n"
+        + "- Include a Missing Critical Data section and note evidence limits.\n"
+        + "- Use conditional or range-based numeric framing unless strongly supported by inputs.\n"
         + "- Avoid repeated bullets across sections.\n"
-        + "- Use operator language and concrete actions.\n"
-        + "- Prefer quantified targets/ranges/thresholds whenever input allows.\n"
-        + "- 30/60/90 plan must be clearly sequenced with distinct actions.\n"
-        + "- Include weekly metrics that a founder can track in one dashboard.\n"
+        + "- 30/60/90 plan must render exactly with clean labels: 30 Days, 60 Days, 90 Days.\n"
+        + "- Immediate Priorities must be ranked 1-5 and each line must start with STOP/TEST/KEEP/INVESTIGATE.\n"
+        + "- Key Metrics must be decision-oriented: Metric - Trigger - Action.\n"
+        + "- Keep practical founder-level actions and concise language.\n"
         + "\nFocus on practical priorities and avoid repeating full raw details."
     )
 
