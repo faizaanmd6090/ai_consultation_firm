@@ -27,16 +27,22 @@ Run from the project root:
 from __future__ import annotations
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from dotenv import load_dotenv
 
 from agents.final_report_agent import run_final_report_agent
-from agents.finance_agent import run_finance_agent
+from agents.finance_agent import run_finance_agent, run_finance_clarification
 from agents.intake_agent import run_intake_agent
-from agents.operations_agent import run_operations_agent
-from agents.reviewer_agent import run_reviewer_agent
-from agents.strategy_agent import run_strategy_agent
+from agents.operations_agent import run_operations_agent, run_operations_clarification
+from agents.reviewer_agent import (
+    build_clarification_answer,
+    run_reviewer_final_with_clarifications,
+    run_reviewer_pass1,
+)
+from agents.strategy_agent import run_strategy_agent, run_strategy_clarification
 from utils.case_intake import (
     case_to_client_narrative,
     collect_case_by_mode,
@@ -66,22 +72,75 @@ def run_turnaround_pipeline(client_problem: str) -> dict[str, Any]:
     Each value matches the shared shape from schemas.agent_output (six common
     fields everywhere; review also has priority_order).
     """
+    pipeline_start = time.perf_counter()
+
     # Intake: frame the problem and align the team on facts, urgency, and data gaps.
+    t = time.perf_counter()
     intake = run_intake_agent(client_problem)
+    print(f"[timing] stage=intake elapsed_ms={int((time.perf_counter() - t) * 1000)}")
 
-    # Parallel workstreams (still run sequentially here for simplicity).
-    finance = run_finance_agent(intake)
-    operations = run_operations_agent(intake)
-    strategy = run_strategy_agent(intake)
+    # Parallel specialist workstreams.
+    specialists_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        finance_future = executor.submit(run_finance_agent, intake)
+        operations_future = executor.submit(run_operations_agent, intake)
+        strategy_future = executor.submit(run_strategy_agent, intake)
+        finance = finance_future.result()
+        operations = operations_future.result()
+        strategy = strategy_future.result()
+    print(f"[timing] stage=specialists_parallel elapsed_ms={int((time.perf_counter() - specialists_start) * 1000)}")
 
-    # Review: integrate all workstreams and set an execution order.
-    review = run_reviewer_agent(intake, finance, operations, strategy)
+    # Reviewer pass 1: decide whether one bounded follow-up round is needed.
+    t = time.perf_counter()
+    review_clarification_plan = run_reviewer_pass1(intake, finance, operations, strategy)
+    print(f"[timing] stage=reviewer_pass1 elapsed_ms={int((time.perf_counter() - t) * 1000)}")
+
+    # Controlled single clarification round (0 or 1 rounds only, <=3 questions).
+    clarifications_start = time.perf_counter()
+    review_clarification_answers: list[dict[str, Any]] = []
+    if review_clarification_plan.get("needs_follow_up"):
+        for item in review_clarification_plan.get("clarification_questions", [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("target_agent", "")).strip().lower()
+            question = str(item.get("question", "")).strip()
+            if not question:
+                continue
+            q_start = time.perf_counter()
+            if target == "finance":
+                lines = run_finance_clarification(intake, finance, question)
+            elif target == "operations":
+                lines = run_operations_clarification(intake, operations, question)
+            elif target == "strategy":
+                lines = run_strategy_clarification(intake, strategy, question)
+            else:
+                continue
+            print(
+                f"[timing] stage=clarification target={target} "
+                f"elapsed_ms={int((time.perf_counter() - q_start) * 1000)}"
+            )
+            review_clarification_answers.append(build_clarification_answer(target, lines[:4]))
+    print(f"[timing] stage=clarifications_total elapsed_ms={int((time.perf_counter() - clarifications_start) * 1000)}")
+
+    # Reviewer pass 2: final integrated synthesis with explicit tradeoff resolution.
+    t = time.perf_counter()
+    review = run_reviewer_final_with_clarifications(
+        intake,
+        finance,
+        operations,
+        strategy,
+        clarification_answers=review_clarification_answers,
+    )
+    print(f"[timing] stage=reviewer_pass2 elapsed_ms={int((time.perf_counter() - t) * 1000)}")
+    print(f"[timing] stage=pipeline_total elapsed_ms={int((time.perf_counter() - pipeline_start) * 1000)}")
 
     return {
         "intake": intake,
         "finance": finance,
         "operations": operations,
         "strategy": strategy,
+        "review_clarification_plan": review_clarification_plan,
+        "review_clarification_answers": review_clarification_answers,
         "review": review,
     }
 
@@ -141,6 +200,8 @@ if __name__ == "__main__":
         results["operations"],
         results["strategy"],
         results["review"],
+        case_text=client_problem,
+        mode=mode,
     )
     _print_founder_report(founder_report)
 

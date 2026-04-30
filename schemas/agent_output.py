@@ -57,3 +57,28 @@ def reviewer_report(
     )
     out["priority_order"] = list(priority_order)
     return out
+
+
+def reviewer_clarification_plan(
+    *,
+    needs_follow_up: bool,
+    top_conflicts: list[str],
+    top_uncertainties: list[str],
+    clarification_questions: list[dict[str, str]],
+) -> dict[str, Any]:
+    """
+    Structured reviewer pass-1 decision payload.
+
+    clarification_questions items must be {"target_agent": "...", "question": "..."}.
+    """
+    return {
+        "needs_follow_up": bool(needs_follow_up),
+        "top_conflicts": list(top_conflicts),
+        "top_uncertainties": list(top_uncertainties),
+        "clarification_questions": list(clarification_questions),
+    }
+
+
+def clarification_answer(*, agent_name: str, answer: list[str]) -> dict[str, Any]:
+    """Structured short clarification response from one specialist."""
+    return {"agent_name": agent_name, "answer": list(answer)}

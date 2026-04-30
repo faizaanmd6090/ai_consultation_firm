@@ -1,0 +1,59 @@
+# AI Management Consulting Firm
+
+## Problem Statement
+Build a multi-agent AI consulting system that helps companies diagnose why they are losing money and recommends turnaround actions.
+
+## Target User
+Companies with high revenue but continuous losses, shrinking margins, or limited cash runway.
+
+## Sample Client Problem
+"Our company has done millions in revenue, but we have had 3 years of continuous losses and cannot afford to keep burning cash. What should we do?"
+
+## Goals
+- Find root causes of losses
+- Identify cost leaks and strategic issues
+- Recommend immediate and long-term actions
+- Generate a consulting-style report
+
+## Agents
+
+### 1. Intake Agent
+Collects and structures the business problem.
+
+### 2. Finance Agent
+Analyzes revenue, profit/loss, margins, burn, and runway.
+
+### 3. Operations Agent
+Finds inefficiencies in processes, teams, and spending.
+
+### 4. Strategy Agent
+Looks at market position, pricing, competition, and growth issues.
+
+### 5. Reviewer Agent
+Critiques the recommendations and improves the final output.
+
+## Required Inputs
+- Company name
+- Industry
+- Revenue for last 3 years
+- Profit/loss for last 3 years
+- Cash reserves
+- Headcount
+- Main business issues
+- Goal of the company
+
+## Final Output
+- Executive summary
+- Root cause analysis
+- Financial diagnosis
+- Operational diagnosis
+- Strategic recommendations
+- 30/90/180 day action plan
+- Risks and assumptions
+
+## MVP
+Version 1 will use:
+- Intake Agent
+- Finance Agent
+- Strategy Agent
+- Final report generator

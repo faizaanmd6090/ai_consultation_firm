@@ -12,12 +12,14 @@ Docs: https://platform.openai.com/docs/guides/migrate-to-responses
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from openai import OpenAI
 
 # Single model for all OpenAI-powered agents; change here if you switch models.
 OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_TIMEOUT_S = float(os.environ.get("OPENAI_TIMEOUT_S", "90"))
 
 
 def _require_api_key() -> str:
@@ -42,15 +44,27 @@ def generate_agent_response(instructions: str, user_input: str) -> str:
         "model": OPENAI_MODEL,
         "instructions": instructions,
         "input": user_input,
+        "timeout": OPENAI_TIMEOUT_S,
     }
 
+    call_start = time.perf_counter()
     try:
         response = client.responses.create(
             **base_kwargs,
             text={"format": {"type": "json_object"}},
         )
-    except Exception:
+        print(
+            f"[timing] openai_call mode=json_object model={OPENAI_MODEL} "
+            f"elapsed_ms={int((time.perf_counter() - call_start) * 1000)}"
+        )
+    except Exception as exc:
+        print(f"[warn] openai_json_object_mode_failed: {exc}")
+        retry_start = time.perf_counter()
         response = client.responses.create(**base_kwargs)
+        print(
+            f"[timing] openai_call mode=text_fallback model={OPENAI_MODEL} "
+            f"elapsed_ms={int((time.perf_counter() - retry_start) * 1000)}"
+        )
 
     return (response.output_text or "").strip()
 
