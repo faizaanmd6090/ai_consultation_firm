@@ -142,24 +142,32 @@ def _llm_assistant_reply(mode: str, user_message: str, draft: CaseInput, missing
     return f"Thanks, I captured that.\n{follow_up}"
 
 
+def _ready_message() -> str:
+    return (
+        "I have enough context to run the analysis. Click Run Analysis to proceed.\n"
+        "You can still add more detail if you want."
+    )
+
+
 @app.get("/api/agent-info")
 def agent_info() -> dict:
     return {
         "agents": [
-            {"id": "intake", "name": "Intake Agent", "description": "Extracts structured business facts and frames the case."},
-            {"id": "finance", "name": "Finance Agent", "description": "Assesses cash, profitability, and unit-economics pressure points."},
-            {"id": "operations", "name": "Operations Agent", "description": "Identifies execution bottlenecks and delivery-side improvement levers."},
-            {"id": "strategy", "name": "Strategy Agent", "description": "Evaluates growth, positioning, pricing, and segment focus options."},
-            {"id": "review", "name": "Reviewer Agent", "description": "Synthesizes cross-agent outputs into an integrated priority order."},
-            {"id": "founder_report", "name": "Founder Report Layer", "description": "Converts synthesis into an executive-ready decision brief."},
+            {"id": "intake", "name": "Intake Agent", "description": "Converts free-form founder context into structured, analysis-ready case facts."},
+            {"id": "finance", "name": "Finance Agent", "description": "Assesses cash trajectory, margin pressure, and unit-economics risk."},
+            {"id": "operations", "name": "Operations Agent", "description": "Surfaces execution bottlenecks and operational turnaround levers."},
+            {"id": "strategy", "name": "Strategy Agent", "description": "Prioritizes growth, segment, and positioning decisions."},
+            {"id": "review", "name": "Reviewer Agent", "description": "Resolves cross-agent tradeoffs into one integrated recommendation set."},
+            {"id": "founder_report", "name": "Founder Report Layer", "description": "Delivers a founder-ready brief with ranked priorities and execution plan."},
         ],
         "orchestration": [
-            "Founder describes company situation in chat.",
-            "Intake orchestration updates structured case draft.",
-            "System asks targeted follow-up questions for missing critical fields.",
-            "Finance, Operations, and Strategy analyze the case.",
-            "Reviewer synthesizes outputs and prioritizes actions.",
-            "Founder report presents final decision summary and execution plan.",
+            "Founder describes company situation, constraints, and objectives in chat.",
+            "Intake orchestration continuously updates a structured case draft.",
+            "System asks targeted follow-up questions for missing critical inputs only.",
+            "Finance, Operations, and Strategy specialists analyze the case in parallel.",
+            "Reviewer may run one focused clarification round for decision-critical conflicts.",
+            "Reviewer synthesizes final priorities and resolves key tradeoffs.",
+            "Founder report delivers a concise decision brief and 30/60/90 execution plan.",
         ],
     }
 
@@ -211,25 +219,53 @@ def intake_chat(payload: IntakeChatRequest) -> dict:
     session.structured_case_draft = CaseInput(**merged)
     session.missing_fields = compute_missing_fields(session.structured_case_draft.model_dump(), session.mode)
     session.readiness_score, session.can_run_analysis = compute_readiness(session.mode, session.missing_fields)
-    session.state = "ready_to_analyze" if session.can_run_analysis else "collecting_info"
+    if session.can_run_analysis and session.detected_intent == "confirm_analysis":
+        session.state = "analyzing"
+        session.last_follow_up_field = ""
+        session.last_follow_up_question = ""
+        assistant_message = "Understood — starting analysis now."
+        session.messages.append(ChatMessage(role="assistant", content=assistant_message))
+        return {
+            "session_id": session.session_id,
+            "assistant_message": assistant_message,
+            "messages": [m.model_dump() for m in session.messages],
+            "structured_case_draft": session.structured_case_draft.model_dump(),
+            "missing_fields": session.missing_fields,
+            "readiness_score": session.readiness_score,
+            "can_run_analysis": True,
+            "state": session.state,
+            "detected_intent": session.detected_intent,
+            "last_follow_up_question": session.last_follow_up_question,
+            "extracted_facts_summary": summarize_extracted_facts(
+                session.structured_case_draft.model_dump(), session.missing_fields, session.readiness_score
+            ),
+            "should_start_analysis": True,
+        }
 
-    follow_up, follow_up_field = choose_next_follow_up(
-        session.mode,
-        session.structured_case_draft.model_dump(),
-        session.missing_fields,
-        last_follow_up_field=session.last_follow_up_field or None,
-    )
-    session.last_follow_up_field = follow_up_field
-    session.last_follow_up_question = follow_up
-    assistant_message = _llm_assistant_reply(
-        mode=session.mode,
-        user_message=user_message,
-        draft=session.structured_case_draft,
-        missing=session.missing_fields,
-        readiness_score=session.readiness_score,
-        can_run=session.can_run_analysis,
-        follow_up=follow_up,
-    )
+    if session.can_run_analysis:
+        session.state = "ready_to_analyze"
+        session.last_follow_up_field = ""
+        session.last_follow_up_question = ""
+        assistant_message = _ready_message()
+    else:
+        session.state = "collecting_info"
+        follow_up, follow_up_field = choose_next_follow_up(
+            session.mode,
+            session.structured_case_draft.model_dump(),
+            session.missing_fields,
+            last_follow_up_field=session.last_follow_up_field or None,
+        )
+        session.last_follow_up_field = follow_up_field
+        session.last_follow_up_question = follow_up
+        assistant_message = _llm_assistant_reply(
+            mode=session.mode,
+            user_message=user_message,
+            draft=session.structured_case_draft,
+            missing=session.missing_fields,
+            readiness_score=session.readiness_score,
+            can_run=session.can_run_analysis,
+            follow_up=follow_up,
+        )
     session.messages.append(ChatMessage(role="assistant", content=assistant_message))
 
     return {
@@ -278,7 +314,21 @@ def analyze_case(payload: AnalyzeCaseRequest) -> dict:
         agents["operations"],
         agents["strategy"],
         agents["review"],
+        case_text=client_problem,
+        mode=payload.mode,
     )
     if payload.session_id and payload.session_id in SESSIONS:
         SESSIONS[payload.session_id].state = "report_ready"
-    return {"founder_report": founder_report, "agents": agents}
+    response_agents = {
+        "intake": agents["intake"],
+        "finance": agents["finance"],
+        "operations": agents["operations"],
+        "strategy": agents["strategy"],
+        "review": agents["review"],
+    }
+    return {
+        "founder_report": founder_report,
+        "agents": response_agents,
+        "review_clarification_plan": agents.get("review_clarification_plan"),
+        "review_clarification_answers": agents.get("review_clarification_answers", []),
+    }
