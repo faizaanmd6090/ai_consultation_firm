@@ -39,7 +39,7 @@ def _mock_operations_report(case_brief: dict) -> dict:
     findings_text = case_brief.get("findings") or []
     has_discount_story = any(
         "discount" in str(x).lower() for x in findings_text
-    ) or any("discount" in str(case_brief.get("summary", "")).lower())
+    ) or ("discount" in str(case_brief.get("summary", "")).lower())
 
     summary = (
         "Operationally, aggressive discounting combined with retention pressure usually "
@@ -130,3 +130,58 @@ def run_operations_agent(case_brief: dict) -> dict:
         print(f"Operations agent could not parse OpenAI response: {exc}")
         print("Using fallback mock operations output.")
         return _mock_operations_report(case_brief)
+
+
+def run_operations_clarification(case_brief: dict, prior_output: dict, question: str) -> list[str]:
+    """
+    Return a short, targeted clarification answer (2-4 bullets), not a full re-analysis.
+    """
+    instructions = (
+        "You are the Operations specialist in a reviewer-led clarification round.\n"
+        "Answer ONLY the assigned question.\n"
+        "Return JSON only: {\"answer\": [\"...\", \"...\"]}\n"
+        "Rules: 2-4 short bullets, operations-only, execution-focused.\n"
+        "Do not re-analyze the full case. Focus on delivery risk, inventory/service reliability, and execution sequencing."
+    )
+    user_input = (
+        "Case brief:\n"
+        + _case_brief_block(case_brief)
+        + "\n\nPrior operations output:\n"
+        + _case_brief_block(prior_output)
+        + "\n\nQuestion:\n"
+        + question.strip()
+    )
+    q_terms = [tok for tok in question.lower().replace("/", " ").split() if len(tok) > 3]
+    try:
+        raw = generate_agent_response(instructions=instructions, user_input=user_input)
+        text = raw.strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            parsed = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), list):
+            out = [str(x).strip() for x in parsed["answer"] if str(x).strip()]
+            out = [x for x in out if "placeholder" not in x.lower() and "example" not in x.lower()]
+            out = [x for x in out if any(t in x.lower() for t in q_terms[:6]) or any(k in x.lower() for k in ("inventory", "service", "stockout", "fulfillment", "retention"))]
+            if len(out) >= 2:
+                return out[:4]
+    except Exception:
+        pass
+    q = question.lower()
+    if "protect" in q:
+        return [
+            "Protect hero-SKU availability and fulfillment reliability for high-repeat cohorts.",
+            "Protect frontline service capacity that directly prevents churn and refund leakage.",
+        ]
+    if "not" in q and "first" in q:
+        return [
+            "Do not start by cutting fulfillment or support headcount tied to retention-critical flows.",
+            "Do not broaden SKU/catalog complexity before forecast accuracy and in-stock stability improve.",
+        ]
+    return [
+        "Inventory and service instability can directly suppress repeat purchase and retention quality.",
+        "Prioritize hero-SKU in-stock reliability before expansion projects or added SKU complexity.",
+        "Avoid cuts that reduce fulfillment and service reliability for high-value cohorts.",
+    ]

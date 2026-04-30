@@ -124,3 +124,60 @@ def run_finance_agent(case_brief: dict) -> dict:
         print(f"Finance agent could not parse OpenAI response: {exc}")
         print("Using fallback mock finance output.")
         return _mock_finance_report(case_brief)
+
+
+def run_finance_clarification(case_brief: dict, prior_output: dict, question: str) -> list[str]:
+    """
+    Return a short, targeted clarification answer (2-4 bullets), not a full re-analysis.
+    """
+    instructions = (
+        "You are the Finance specialist in a reviewer-led clarification round.\n"
+        "Answer ONLY the assigned question.\n"
+        "Return JSON only: {\"answer\": [\"...\", \"...\"]}\n"
+        "Rules: 2-4 short bullets, finance-only, concrete and decision-oriented.\n"
+        "Do not re-analyze the full case. Do not discuss operations or strategy except as a direct financial implication.\n"
+        "Prioritize guidance on cut first, protect financially, and sequencing."
+    )
+    user_input = (
+        "Case brief:\n"
+        + _case_brief_block(case_brief)
+        + "\n\nPrior finance output:\n"
+        + _case_brief_block(prior_output)
+        + "\n\nQuestion:\n"
+        + question.strip()
+    )
+    q_terms = [tok for tok in question.lower().replace("/", " ").split() if len(tok) > 3]
+    try:
+        raw = generate_agent_response(instructions=instructions, user_input=user_input)
+        text = raw.strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            parsed = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
+        ans = parsed.get("answer") if isinstance(parsed, dict) else None
+        if isinstance(ans, list):
+            out = [str(x).strip() for x in ans if str(x).strip()]
+            out = [x for x in out if "placeholder" not in x.lower() and "example" not in x.lower()]
+            out = [x for x in out if any(t in x.lower() for t in q_terms[:6]) or any(k in x.lower() for k in ("cut", "protect", "payback", "margin", "cash"))]
+            if len(out) >= 2:
+                return out[:4]
+    except Exception:
+        pass
+    q = question.lower()
+    if "protect" in q:
+        return [
+            "Protect spend tied to the fastest CAC payback and strongest repeat economics.",
+            "Protect lifecycle retention programs that lower effective CAC and stabilize gross profit.",
+        ]
+    if "not" in q and "first" in q:
+        return [
+            "Do not start with blanket percentage cuts across all channels; cut low-payback channels first.",
+            "Do not cut instrumentation/reporting capacity first; keep weekly payback and contribution visibility intact.",
+        ]
+    return [
+        "Cut lowest-payback paid channels first; protect channels with stronger repeat and contribution performance.",
+        "Do not spread cuts evenly across channels; sequence reductions by cash conversion and payback evidence.",
+        "Protect retention-supporting spend that prevents near-term revenue leakage and payback deterioration.",
+    ]

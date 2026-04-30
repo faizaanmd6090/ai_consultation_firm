@@ -127,3 +127,58 @@ def run_strategy_agent(case_brief: dict) -> dict:
         print(f"Strategy agent could not parse OpenAI response: {exc}")
         print("Using fallback mock strategy output.")
         return _mock_strategy_report(case_brief)
+
+
+def run_strategy_clarification(case_brief: dict, prior_output: dict, question: str) -> list[str]:
+    """
+    Return a short, targeted clarification answer (2-4 bullets), not a full re-analysis.
+    """
+    instructions = (
+        "You are the Strategy specialist in a reviewer-led clarification round.\n"
+        "Answer ONLY the assigned question.\n"
+        "Return JSON only: {\"answer\": [\"...\", \"...\"]}\n"
+        "Rules: 2-4 short bullets, strategy-only, commercial tradeoff focused.\n"
+        "Do not re-analyze the full case. Focus on where to compete, what to protect, and what not to do first."
+    )
+    user_input = (
+        "Case brief:\n"
+        + _case_brief_block(case_brief)
+        + "\n\nPrior strategy output:\n"
+        + _case_brief_block(prior_output)
+        + "\n\nQuestion:\n"
+        + question.strip()
+    )
+    q_terms = [tok for tok in question.lower().replace("/", " ").split() if len(tok) > 3]
+    try:
+        raw = generate_agent_response(instructions=instructions, user_input=user_input)
+        text = raw.strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            parsed = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), list):
+            out = [str(x).strip() for x in parsed["answer"] if str(x).strip()]
+            out = [x for x in out if "placeholder" not in x.lower() and "example" not in x.lower()]
+            out = [x for x in out if any(t in x.lower() for t in q_terms[:6]) or any(k in x.lower() for k in ("channel", "segment", "pricing", "protect", "cut"))]
+            if len(out) >= 2:
+                return out[:4]
+    except Exception:
+        pass
+    q = question.lower()
+    if "protect" in q:
+        return [
+            "Protect channels and segments with stronger repeat behavior and healthier contribution economics.",
+            "Protect the core offer for the highest-LTV cohort before funding adjacent experiments.",
+        ]
+    if "not" in q and "first" in q:
+        return [
+            "Do not start with broad repositioning; first fix channel/segment mix quality and discount discipline.",
+            "Do not apply uniform growth cuts across all channels; keep selective investment where unit economics remain defensible.",
+        ]
+    return [
+        "Protect efficient channels/segments with healthier repeat behavior under profitability-focused cuts.",
+        "Cut low-quality acquisition first; avoid equal cuts across all growth channels.",
+        "Sequence pricing and offer tests after stabilizing acquisition quality and retention signals.",
+    ]
