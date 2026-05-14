@@ -152,55 +152,6 @@ Reviewer Pass 2
    ↓
 Founder Report
 
-Repository Structure
-
-AI_Agents_project/
-│
-├── agents/
-│   ├── intake_agent.py
-│   ├── finance_agent.py
-│   ├── operations_agent.py
-│   ├── strategy_agent.py
-│   ├── reviewer_agent.py
-│   └── final_report_agent.py
-│
-├── prompts/
-│   ├── intake_prompt.md
-│   ├── finance_prompt.md
-│   ├── operations_prompt.md
-│   ├── strategy_prompt.md
-│   ├── reviewer_prompt.md
-│   └── final_report_prompt.md
-│
-├── schemas/
-│   ├── __init__.py
-│   └── agent_output.py
-│
-├── services/
-│   ├── __init__.py
-│   ├── openai_client.py
-│   └── intake_orchestrator.py
-│
-├── utils/
-│   ├── __init__.py
-│   ├── prompt_loader.py
-│   ├── consulting_json.py
-│   ├── case_intake.py
-│   └── input_validation.py
-│
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   ├── components/
-│   │   └── lib/
-│   └── package.json
-│
-├── api_server.py
-├── app.py
-├── requirements.txt
-├── requirements-web.txt
-└── README.md
-
 
 Tech Stack
 Backend
